@@ -1,40 +1,116 @@
-from typing import Annotated
+import os
+import time
+from typing import Dict, Any, List
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+import boto3
+from botocore.config import Config
+from fastapi import APIRouter, Query
 
-from api.auth import api_key_auth
-from api.models.bedrock import BedrockModel
-from api.schema import Model, Models
+router = APIRouter()
 
-router = APIRouter(
-    prefix="/models",
-    dependencies=[Depends(api_key_auth)],
-    # responses={404: {"description": "Not found"}},
-)
-
-chat_model = BedrockModel()
+MODELS_CACHE: Dict[str, Any] = {"data": None, "ts": 0}
+CACHE_TTL_SECONDS = 300
 
 
-async def validate_model_id(model_id: str):
-    if model_id not in chat_model.list_models():
-        raise HTTPException(status_code=500, detail="Unsupported Model Id")
+def _now() -> int:
+    return int(time.time())
 
 
-@router.get("", response_model=Models)
-async def list_models():
-    model_list = [Model(id=model_id) for model_id in chat_model.list_models()]
-    return Models(data=model_list)
+def _bedrock_client():
+    """Return a boto3 Bedrock client."""
+    region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+    return boto3.client(
+        "bedrock",
+        region_name=region,
+        config=Config(retries={"max_attempts": 5, "mode": "standard"}),
+    )
 
 
-@router.get(
-    "/{model_id}",
-    response_model=Model,
-)
-async def get_model(
-    model_id: Annotated[
-        str,
-        Path(description="Model ID", example="anthropic.claude-3-sonnet-20240229-v1:0"),
-    ],
+def _list_foundation_models(client) -> List[Dict[str, Any]]:
+    """List Bedrock foundation models and normalize for /models output."""
+    out: List[Dict[str, Any]] = []
+    resp = client.list_foundation_models()
+    for m in resp.get("modelSummaries", []):
+        mid = m.get("modelId")
+        if not mid:
+            continue
+        out.append(
+            {
+                "id": mid,
+                "created": _now(),
+                "object": "model",
+                "owned_by": "bedrock",
+            }
+        )
+    return out
+
+
+def _list_cross_region_profiles(client) -> List[Dict[str, Any]]:
+    """List Bedrock system-defined inference profiles (cross-region)."""
+    out: List[Dict[str, Any]] = []
+    paginator = client.get_paginator("list_inference_profiles")
+    for page in paginator.paginate(typeEquals="SYSTEM_DEFINED", maxResults=1000):
+        for s in page.get("inferenceProfileSummaries", []):
+            pid = s.get("inferenceProfileId")
+            arn = s.get("inferenceProfileArn")
+            created_at = s.get("createdAt")
+            created_ts = (
+                int(created_at.timestamp())
+                if hasattr(created_at, "timestamp")
+                else _now()
+            )
+            if pid:
+                out.append(
+                    {
+                        "id": pid,
+                        "created": created_ts,
+                        "object": "model",
+                        "owned_by": "bedrock",
+                    }
+                )
+            if arn:
+                out.append(
+                    {
+                        "id": arn,
+                        "created": created_ts,
+                        "object": "model",
+                        "owned_by": "bedrock",
+                    }
+                )
+    return out
+
+
+def _build_models_payload(force_refresh: bool = False) -> Dict[str, Any]:
+    """Build the /models payload with caching."""
+    if (
+        not force_refresh
+        and MODELS_CACHE["data"]
+        and _now() - MODELS_CACHE["ts"] < CACHE_TTL_SECONDS
+    ):
+        return MODELS_CACHE["data"]
+
+    client = _bedrock_client()
+    fm_entries = _list_foundation_models(client)
+    xreg_entries = _list_cross_region_profiles(client)
+
+    seen = set()
+    data: List[Dict[str, Any]] = []
+    for item in fm_entries + xreg_entries:
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        data.append(item)
+
+    payload = {"object": "list", "data": data}
+    MODELS_CACHE["data"] = payload
+    MODELS_CACHE["ts"] = _now()
+    return payload
+
+
+@router.get("/models")
+def list_models(
+    refresh: bool = Query(
+        False, description="Refresh the cached model list (FMs + cross-region profiles)"
+    ),
 ):
-    await validate_model_id(model_id)
-    return Model(id=model_id)
+    return _build_models_payload(force_refresh=refresh)
